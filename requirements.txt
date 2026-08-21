@@ -1,0 +1,10 @@
+# Verified working on macOS / Apple Silicon (Python 3.13, torch MPS)
+torch==2.13.0
+transformers==5.15.1
+peft==0.20.0
+accelerate==1.14.0
+datasets==5.0.1
+bitsandbytes==0.50.1
+mlflow==3.15.1
+optuna
+scikit-learn==1.9.0

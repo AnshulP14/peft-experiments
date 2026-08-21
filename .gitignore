@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+data/
+output/
+mlruns/
+mlruns.db
+runs/
+.venv/
+venv/
+.env
+.DS_Store
+*.log
+.cache/
+
