@@ -5,9 +5,10 @@ Every method file (qlora.py, lora.py, ...) calls:
     config = RunConfig.from_args(args, method="qlora")
     metrics = run_training(config, prune=optional_optuna_trial)
 
-and gets: dataset loading/caching, chat-template collator (loss masked to the
-response), QLoRA/model building is method-specific (see each method file),
-MLflow run logging, optional Optuna pruning, sample generation.
+and gets: dataset loading/caching, chat-template collator (multi-turn, loss
+masked to assistant turns; `messages` or legacy `prompt`/`response` rows),
+QLoRA/model building is method-specific (see each method file), MLflow run
+logging, optional Optuna pruning, sample generation.
 
 Config resolution order for every hyperparameter:
     CLI flag  >  PEFT_* env var  >  built-in default
@@ -200,11 +201,30 @@ def load_processed(
     num_eval: Optional[int],
     seed: int,
 ) -> tuple[Dataset, Optional[Dataset]]:
-    """Load (and cache processed parquet for) the experiment dataset.
+    """Load the experiment dataset.
 
-    Accepts `prompt`/`response` columns, or the common alpaca-style
-    `instruction`/`input`/`output` columns (normalized to prompt/response).
+    Two sources, tried in order:
+      1. Canonical local dataset: `data_dir/<name>/{train,val}.parquet` in the
+         HF messages format (produced by scripts/prepare_data.py; see
+         data/manifest.json). `val.parquet` is used for eval.
+      2. HF hub id (cached processed parquet), accepting `prompt`/`response`
+         or alpaca-style `instruction`/`input`/`output` columns.
     """
+    local_train = os.path.join(data_dir, dataset_name, "train.parquet")
+    if os.path.exists(local_train):
+        print(f"[data] loading canonical local dataset {local_train}")
+        train_ds = Dataset.from_parquet(local_train).shuffle(seed=seed)
+        if num_train:
+            train_ds = train_ds.select(range(min(num_train, len(train_ds))))
+        eval_ds = None
+        if num_eval:
+            local_val = os.path.join(data_dir, dataset_name, "val.parquet")
+            if os.path.exists(local_val):
+                val = Dataset.from_parquet(local_val).shuffle(seed=seed)
+                eval_ds = val.select(range(min(num_eval, len(val))))
+            else:
+                eval_ds = train_ds.select(range(min(num_eval, len(train_ds))))
+        return train_ds, eval_ds
     os.makedirs(data_dir, exist_ok=True)
     cache_path = os.path.join(
         data_dir, f"processed_{dataset_name.split('/')[-1]}_{subset or 'default'}.parquet"
@@ -244,33 +264,85 @@ def load_processed(
 
 
 # --------------------------------------------------------------------------- #
-# Collator: chat-template formatting, loss masked to the response
+# Collator: chat-template formatting, loss masked to assistant turns
 # --------------------------------------------------------------------------- #
 class ChatCollator:
+    """Apply the model's chat template to each example and mask the loss to
+    assistant turns only.
+
+    This is the single model-specific point in the pipeline: special delimiter
+    tokens are injected here by the run's tokenizer, so datasets stay plain
+    text and one copy of them serves every model.
+
+    Accepts `messages` rows (canonical chat format, single- or multi-turn) or
+    legacy `prompt`/`response` rows (treated as a 2-message conversation).
+    """
+
     def __init__(self, tokenizer, max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
+    def _messages(self, f):
+        if "messages" in f:
+            return f["messages"]
+        msgs = [{"role": "user", "content": f["prompt"]}]
+        if f.get("response"):
+            msgs.append({"role": "assistant", "content": f["response"]})
+        return msgs
+
+    def _encode(self, messages):
+        """Tokenize via the chat template; labels are token ids on assistant
+        spans, -100 elsewhere. Assistant spans are found by diffing incremental
+        template renders, so delimiters/boilerplate are never trained on."""
+        full_ids = self.tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False)
+        if len(full_ids) > self.max_length:
+            full_ids = full_ids[: self.max_length]
+        labels = [-100] * len(full_ids)
+        before_ids = []
+        for i, m in enumerate(messages):
+            after_ids = self.tokenizer.apply_chat_template(messages[: i + 1], tokenize=True, return_dict=False)
+            # Prefix property: templates that rebuild their render (e.g. Qwen
+            # prepends a default system message) are not incremental, so only
+            # trust the diff when the render is a true extension of before_ids.
+            if m["role"] == "assistant" and after_ids[: len(before_ids)] == before_ids:
+                # The new tokens are exactly this turn's span, delimiters
+                # included. Only accept the diff if it actually extends the
+                # stored prefix (guards against non-incremental renders).
+                if len(after_ids) > len(before_ids):
+                    for pos in range(len(before_ids), len(after_ids)):
+                        if pos < len(labels):
+                            labels[pos] = after_ids[pos]
+            else:
+                # Fallback: this turn's tokens are what the full render adds
+                # after the render of messages[:i]. Only label for assistant
+                # turns; for other roles just advance the prefix.
+                if m["role"] == "assistant":
+                    base = (
+                        self.tokenizer.apply_chat_template(
+                            messages[:i], tokenize=True, return_dict=False
+                        )
+                        if i
+                        else []
+                    )
+                    for pos in range(len(base), len(after_ids)):
+                        if pos < len(labels) and after_ids[pos] == full_ids[pos]:
+                            labels[pos] = after_ids[pos]
+            before_ids = after_ids
+        return full_ids, labels
+
     def __call__(self, features):
         input_ids, labels = [], []
         for f in features:
-            prompt_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": f["prompt"]}],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-            )
-            full_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": f["prompt"]}, {"role": "assistant", "content": f["response"]}],
-                tokenize=True,
-                return_dict=False,
-            )
-            if len(full_ids) > self.max_length:
-                full_ids = full_ids[: self.max_length]
-            resp_len = max(0, len(full_ids) - len(prompt_ids))
-            lbl = [-100] * (len(full_ids) - resp_len) + full_ids[-resp_len:] if resp_len else [-100] * len(full_ids)
-            input_ids.append(full_ids)
-            labels.append(lbl)
+            ids, lbl = self._encode(self._messages(f))
+            if any(l != -100 for l in lbl):
+                input_ids.append(ids)
+                labels.append(lbl)
+        if not input_ids:
+            # Degenerate batch (all rows zero-signal) — emit one padding row so
+            # the trainer never sees an empty batch.
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            input_ids.append([pad_id])
+            labels.append([-100])
 
         max_len = max(len(x) for x in input_ids)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
@@ -290,14 +362,25 @@ class ChatCollator:
 # --------------------------------------------------------------------------- #
 @torch.inference_mode()
 def generate_samples(model, tokenizer, eval_ds, max_new_tokens: int, n: int):
-    """Greedy completions for the first n eval prompts."""
+    """Greedy completions for the first n eval rows. Supports multi-turn
+    `messages` rows (prompt = conversation up to the final assistant turn,
+    reference = that turn) and legacy `prompt`/`response` rows."""
     model.eval()
     device = next(model.parameters()).device
     samples = []
     for i in range(min(n, len(eval_ds))):
         row = eval_ds[i]
+        if "messages" in row:
+            msgs = row["messages"]
+            reference = next(
+                (m["content"] for m in reversed(msgs) if m["role"] == "assistant"), ""
+            )
+            prompt_msgs = msgs[:-1] if msgs and msgs[-1]["role"] == "assistant" else msgs
+        else:
+            prompt_msgs = [{"role": "user", "content": row["prompt"]}]
+            reference = row["response"]
         prompt_out = tokenizer.apply_chat_template(
-            [{"role": "user", "content": row["prompt"]}],
+            prompt_msgs,
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
@@ -305,7 +388,13 @@ def generate_samples(model, tokenizer, eval_ds, max_new_tokens: int, n: int):
         prompt_ids = prompt_out["input_ids"].to(device)
         out_ids = model.generate(prompt_ids, max_new_tokens=max_new_tokens, do_sample=False)
         text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-        samples.append({"prompt": row["prompt"], "reference": row["response"], "completion": text})
+        samples.append(
+            {
+                "prompt": prompt_msgs[-1]["content"][:500] if prompt_msgs else "",
+                "reference": reference,
+                "completion": text,
+            }
+        )
     model.train()
     return samples
 

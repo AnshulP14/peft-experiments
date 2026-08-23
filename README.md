@@ -23,11 +23,43 @@ peft_experiments/
 ├── methods/
 │   ├── common.py      # RunConfig (env layer), collator, MLflow + pruning callbacks, dataset cache
 │   └── qlora.py       # QLoRA (NF4 4-bit + LoRA) — done, smoke-tested on MPS
+├── scripts/
+│   ├── prepare_data.py    # raw datasets -> canonical chat-format parquet (data/<name>/)
+│   └── smoke_collator.py  # collator unit checks (run after touching ChatCollator)
 ├── tune.py            # Optuna meta-tuning driver (search space per method)
+├── data/              # raw + canonical datasets (gitignored; rebuilt via scripts/prepare_data.py)
 ├── run_overnight.sh   # detached study launcher (auto-resumes on re-run)
 ├── Makefile
 ├── .env.example       # all PEFT_* variables documented
-└── data/ output/      # processed-dataset cache / runs, mlflow store, tuning state (gitignored)
+└── output/            # runs, mlflow store, tuning state (gitignored)
+```
+
+## Datasets
+
+Five mental-health conversation datasets live in `data/` (see `data/README.md`
+for provenance). `scripts/prepare_data.py` converts them to the canonical
+format — one plain-text `messages` row per conversation
+(`[{"role": "user"|"assistant", "content": ...}]`), split into
+`data/<name>/train.parquet` + `val.parquet`, plus `meta.json` and a
+`data/manifest.json` index:
+
+| name | rows (train/val) | shape |
+|---|---|---|
+| `mentalchat16k` | 5995/315 | single-turn |
+| `psydial` | 1119/58 | multi-turn (up to 149 msgs, Chinese) |
+| `empathlm` | 684/76 | single-turn, DPO pairs kept in extra cols |
+| `mhdialog` | 690/150 | multi-turn (10 rounds) |
+| `indiemh` | 142/21 | multi-turn dialogue, code-mixed Hindi-English |
+
+No special tokens are written: the model's chat-template delimiters are
+applied at train time by `ChatCollator` (the one model-specific point), so one
+copy of the data serves every model.
+
+```bash
+../.venv/bin/python scripts/prepare_data.py            # (re)build all
+make train DATASET=psydial                             # finetune on one
+make train DATASET=empathlm MODEL=Qwen/Qwen2.5-1.5B-Instruct
+PEFT_NUM_TRAIN=64 PEFT_EPOCHS=1 make train DATASET=psydial   # smoke (~2 min)
 ```
 
 ## Quick start

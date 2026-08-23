@@ -1,7 +1,7 @@
 PY := ../.venv/bin/python
 MLFLOW_URI := http://127.0.0.1:5000
 
-.PHONY: install serve serve-stop qlora qlora-smoke tune tune-smoke overnight
+.PHONY: install serve serve-stop qlora qlora-smoke train tune tune-smoke overnight
 
 install:
 	../.venv/bin/pip install -r requirements.txt
@@ -21,6 +21,10 @@ qlora:            ## full QLoRA run (env/CLI config; see .env.example)
 
 qlora-smoke:      ## ~1 min smoke test (64 rows, 1 epoch)
 	PEFT_NUM_TRAIN=64 PEFT_EPOCHS=1 $(PY) methods/qlora.py
+
+train:            ## finetune on a canonical dataset: make train DATASET=psydial [MODEL=... PEFT_*=...]
+	@test -n "$(DATASET)" || (echo "usage: make train DATASET=<name> (see data/manifest.json)"; exit 1)
+	PEFT_DATASET_NAME=$(DATASET) $(if $(MODEL),PEFT_MODEL=$(MODEL)) $(PY) methods/qlora.py
 
 tune:             ## Optuna study: 50 trials / 12h (resumable; --study to name it)
 	$(PY) tune.py --n_trials 50 --timeout 12h
