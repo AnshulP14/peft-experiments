@@ -12,3 +12,4 @@ venv/
 *.log
 .cache/
 
+.venv-bench/
